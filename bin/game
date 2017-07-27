@@ -1,0 +1,25 @@
+#!/usr/bin/env php
+<?php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use BattleshipsApi\CliClient\Command\GameCommand;
+use BattleshipsApi\Client\Client\ApiClientFactory;
+use CLI\Cursor;
+use Symfony\Component\Console\Application;
+
+// declare ApiClient
+$apiClient = ApiClientFactory::build();
+
+$application = new Application();
+$gameCommand = new GameCommand();
+$application->add($gameCommand);
+$application->setDefaultCommand($gameCommand->getName(), true);
+$application->setCatchExceptions(false);
+try {
+    $application->run();
+} catch (\Throwable $e) {
+    echo $e->getMessage();
+    system('stty icanon echo');
+    Cursor::show();
+}

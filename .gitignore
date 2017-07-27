@@ -1,4 +1,4 @@
-/bin/
+/bin/*
 /vendor/
 !bin/game
 phpunit.xml

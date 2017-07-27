@@ -23,13 +23,13 @@
         "php": ">=7.0",
         "psr/log": "^1.0",
         "symfony/console": "^3.2",
+        "symfony/event-dispatcher": "^3.2",
         "jlekowski/battleships-apiclient": "dev-develop",
-        "donatj/cli-toolkit": "^0.1.1"
+        "donatj/cli-toolkit": "^0.2.0"
     },
     "require-dev": {
         "phpunit/phpunit": "^6.0",
-        "squizlabs/php_codesniffer": "^2.8"
-
+        "squizlabs/php_codesniffer": "^3.0"
     },
     "config": {
         "bin-dir": "bin"

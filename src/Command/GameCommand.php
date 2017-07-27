@@ -2,26 +2,43 @@
 
 namespace BattleshipsApi\CliClient\Command;
 
+use BattleshipsApi\CliClient\Board\CursorHandler;
+use BattleshipsApi\CliClient\Board\CursorInfo;
+use BattleshipsApi\CliClient\Board\Writer;
+use BattleshipsApi\CliClient\Event\CliClientEvents;
+use BattleshipsApi\CliClient\Event\InputEvent;
+use BattleshipsApi\CliClient\GameInfo;
+use BattleshipsApi\CliClient\GameManager;
+use BattleshipsApi\CliClient\Subscriber\CursorSubscriber;
+use BattleshipsApi\CliClient\Subscriber\ResponseSubscriber;
+use BattleshipsApi\CliClient\Subscriber\TerminalInputSubscriber;
+use BattleshipsApi\Client\Client\ApiClient;
 use BattleshipsApi\Client\Client\ApiClientFactory;
-use BattleshipsApi\Client\Request\User\GetUserRequest;
-use CLI\Cursor;
+use BattleshipsApi\Client\Event\ApiClientEvents;
+use BattleshipsApi\Client\Listener\RequestConfigListener;
+use BattleshipsApi\Client\Request\Game\CreateGameRequest;
+use BattleshipsApi\Client\Request\Game\GetGamesRequest;
+use BattleshipsApi\Client\Request\Game\UpdateGameRequest;
+use BattleshipsApi\Client\Request\User\CreateUserRequest;
+use BattleshipsApi\Client\Response\ApiResponse;
 use CLI\Erase;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Helper\QuestionHelper;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Question\ChoiceQuestion;
+use Symfony\Component\Console\Question\ConfirmationQuestion;
+use Symfony\Component\Console\Question\Question;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 
 class GameCommand extends Command
 {
-    /** Array with Y axis elements */
-    /* protected */ const AXIS_Y = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
-    /** Array with X axis elements */
-    /* protected */ const AXIS_X = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
-
-    protected $currentLine = 0;
-    protected $currentColumn = 0;
-    protected $board = 1;
-    protected $consoleCursor = 1;
+    /**
+     * @var ApiClient
+     */
+    protected $apiClient;
 
     /**
      * @inheritdoc
@@ -30,8 +47,11 @@ class GameCommand extends Command
     {
         $this
             ->setName('game')
-            ->setDescription('Temp command')
-            ->addArgument('url', InputArgument::OPTIONAL, 'API url', 'http://battleships-api.dev.lekowski.pl:6081/v1')
+            ->setDescription('Start battleships game')
+            ->addArgument('game', InputArgument::OPTIONAL, 'Game ID')
+            ->addOption('url', 'u', InputOption::VALUE_OPTIONAL, 'API url', 'http://battleships-api.dev.lekowski.pl')
+            ->addUsage('123 -u http://battleships-api.dev.lekowski.pl')
+            ->addUsage('--url http://battleships-api.vagrant')
         ;
     }
 
@@ -40,223 +60,181 @@ class GameCommand extends Command
      */
     protected function execute(InputInterface $input, OutputInterface $output)
     {
-        $token = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6MSwidG9rZW4iOiJhYjQ4ZGViODQ1OGE5NTI2ZmJkMTc4ZjJhMTA2MjkyOCJ9.yZGIMiWFHLZi0KtP5VDrf9PnlMZBK82tJksGVXFRSlI';
-        $apiClient = ApiClientFactory::build([
-            'baseUri' => 'http://battleships-api.vagrant:8080',
-            'version' => 1,
-            'key' => $token
-        ]);
-        $request = new GetUserRequest();
-        $request->setUserId(1);
+        $questionHelper = $this->getHelper('question');
+
+        $url = $input->getOption('url');
+        $gameId = $input->getArgument('game');
+
+        $apiConfig = ['baseUri' => $url, 'version' => 1];
+
+        $apiKeyStorageFile = __DIR__ . '/../../.apiKey';
+        $apiKey = '';
+        if (file_exists($apiKeyStorageFile) && is_readable($apiKeyStorageFile)) {
+            $apiKey = trim(file_get_contents($apiKeyStorageFile));
+            $apiConfig['key'] = $apiKey;
+        }
+
+        $apiClient = ApiClientFactory::build($apiConfig);
+        $eventDispatcher = $apiClient->getDispatcher();
+
+        $cursorInfo = new CursorInfo();
+        $cursorHandler = new CursorHandler($cursorInfo);
+
+        $writer = new Writer($cursorInfo, STDERR);
+        $writer->setCursorHandler($cursorHandler);
+
+        if ($apiKey === '') {
+            $createUserResponse = $this->createUser($questionHelper, $input, $output, $apiClient);
+            $apiKey = $createUserResponse->getHeader(ApiResponse::HEADER_API_KEY);
+            try {
+                $this->setupApiKey($apiKey, $eventDispatcher, $apiKeyStorageFile);
+            } catch (\Exception $e) {
+                $output->writeln(sprintf('<comment>%s</comment>', $e->getMessage()));
+                $output->writeln('<info>Next time you run the game, you need to create a new user</info>');
+
+                $question = new ConfirmationQuestion('<question>Do you want to continue? </question>', true);
+                if (!$questionHelper->ask($input, $output, $question)) {
+                    return;
+                }
+            }
+        }
+
+        if ($gameId === null) {
+            $gameId = $this->handleGettingGameId($questionHelper, $input, $output, $apiClient);
+        }
+
+        $gameInfo = new GameInfo($gameId);
+
+        $gameManager = new GameManager($apiClient, $cursorHandler, $writer);
+        $eventDispatcher->addSubscriber(new TerminalInputSubscriber($gameManager, $cursorInfo, $cursorHandler, $writer));
+        $eventDispatcher->addSubscriber(new CursorSubscriber());
+        $eventDispatcher->addSubscriber(new ResponseSubscriber($writer, $cursorHandler, $gameInfo));
+
+        Erase::screen();
 
         stream_set_blocking(STDIN, false);
         system('stty -icanon -echo');
 
-        Erase::screen();
-
-        $battleground = $this->getBattleground();
-        $this->write($battleground);
-
-//        $currentLine = count(explode(PHP_EOL, $battleground));
-        $this->board = 1;
-        $this->currentColumn += 6;
-        Cursor::forward(6);
-//        Cursor::restore();
-        $this->currentLine += 2;
-        Cursor::up(2);
-//        Cursor::save();
-        Cursor::show();
-        while (true) {
-//            $input = fgetc(STDIN);
+        $gameManager->run($gameInfo);
+        $lastUpdate = microtime(true);
+        $updateInterval = 2.0; // in sec
+        while ($gameManager->keepRunning()) {
             $input = fgets(STDIN);
-
             if ($input) {
-                if ($input === chr(10)) {
-//                    Cursor::unsave();
-                } else {
-
-////                $apiResponse = $apiClient->call($request);
-//                    $this->write("\x1B[2K");
-////                Cursor::back(strlen($input) + 1);
-//                    Cursor::back(strlen($input) > 1 ? strlen($input) + 1 : 1);
-//                    Cursor::savepos();
-////                Cursor::back(0);
-//                    $this->write("\x0D");
-//                    $this->write(explode(PHP_EOL, $battleground)[$currentLine - 1]);
-//                    Cursor::restore();
-////                Cursor::savepos();
-                }
-
-                switch ($input) {
-                    // chr(27) \033"
-                    case "\x1B[A": // up
-//                        $this->write('up');
-                        if ($this->currentLine < 20) {
-                            $this->currentLine += 2;
-                            Cursor::up(2);
-                        }
-                        break;
-                    case "\x1B[B": // down
-//                        $this->write('down');
-                        if ($this->currentLine > 2) {
-                            $this->currentLine -= 2;
-                            Cursor::down(2);
-                        }
-                        break;
-                    case "\x1B[C": // right
-//                        $this->write('right');
-                        if ($this->currentColumn < 42) {
-                            $this->currentColumn += 4;
-                            Cursor::forward(4);
-                        }
-                        break;
-                    case "\x1B[D": // left
-//                        $this->write('left');
-                        if ($this->currentColumn > 6) {
-                            $this->currentColumn -= 4;
-                            Cursor::back(4);
-                        }
-                        break;
-                    case chr(10): // enter
-//                        Cursor::up();
-//                        Cursor::forward($currentColumnt);
-                        Cursor::hide();
-                        $apiResponse = $apiClient->call($request);
-                        Cursor::show();
-                        break;
-                    case chr(9): // tab
-                        if ($this->board === 1) {
-                            $this->board = 2;
-                            Cursor::forward(47);
-                        } else {
-                            $this->board = 1;
-                            Cursor::back(47);
-                        }
-                        break;
-                    case chr(127): // backspace
-                        $this->consoleEraseChar();
-                        break;
-                    case chr(27): // esc
-                        Cursor::back($this->currentColumn + ($this->board === 2 ? 47 : 0));
-                        Cursor::down($this->currentLine);
-                        Cursor::show();
-                        system('stty icanon echo');
-                        return;
-                    case '':
-                    default:
-                        if (strlen($input) == 1) {
-                            $this->consoleWrite($input);
-//                            $this->consoleWrite(ord($input));
-                        }
-//                        Cursor::down();
-//                        Graphics::box(3, 3, 13, 13);
-//                        $i++;
-//                        Graphics::line($i, $i, $i + 10, $i);
-                        break;
-                }
-//
-//                $this->write("\x1B[2K");
-
-//                file_put_contents('/home/jerzy/dev/private/battleships-apiclient/temp.log', $input, FILE_APPEND);
-//            $this->write("\x0D");
-//                $this->write("\x1B[2K");
-//            $this->write(str_repeat("\x1B[1A\x1B[2K", 1));
-//            $this->write("\033[K");
-//            $this->write("\r");
-//                $this->write(Cursor::back(strlen($input) + 1));
-//                $this->write($input);
-//                $this->write(ord($input));
+                // UP arrow key is 3-char long :/ Later maybe check if some predefined strings in the input?
+//                // if got more than 1 character, handle them separately
+//                $inputChars = mb_strlen($input) > 1
+//                    ? preg_split('//u', $input, null, PREG_SPLIT_NO_EMPTY) // str_split for multibyte characters
+//                    : [$input];
+//                tempLog(print_r($inputChars, 1));
+//                foreach ($inputChars as $inputChar) {
+//                    $eventDispatcher->dispatch(CliClientEvents::ON_INPUT, new InputEvent($inputChar));
+//                }
+                $eventDispatcher->dispatch(CliClientEvents::ON_INPUT, new InputEvent($input));
+            } elseif (microtime(true) - $lastUpdate > $updateInterval) {
+                $gameManager->getUpdates();
+                $lastUpdate = microtime(true);
             }
-
             usleep(500);
         }
+
+        system('stty icanon echo');
     }
 
-    private function getBattleground()
-    {
-        $marks = array('ship' => "S", 'miss' => ".", 'hit' => "x", 'sunk' => "X");
-        $board  = sprintf(
-            "\n     % 39.39s        % 39.39s \n\n",
-            "Player 1",
-            "Player 2"
-        );
-        $board .= "    ";
-
-        // 11 rows (first row for X axis labels)
-        for ($i = 0; $i < 11; $i++) {
-            // 11 divs/columns in each row (first column for Y axis labels)
-            for ($j = 0; $j < 11; $j++) {
-                if ($i == 0 && $j > 0) {
-                    $text = self::AXIS_X[($j - 1)];
-                    $board .= sprintf(" % 2s ", $text);
-                } elseif ($j == 0 && $i > 0) {
-                    $text = self::AXIS_Y[($i - 1)];
-                    $board .= sprintf(" % 2s |", $text);
-                } elseif ($j > 0 && $i > 0) {
-                    $coords = self::AXIS_Y[($i - 1)] . self::AXIS_X[($j - 1)];
-//                    $text = isset($battle->playerGround->{$coords})
-//                        ? $marks[ $battle->playerGround->{$coords} ]
-//                        : "";
-                    $text = '';
-                    $board .= sprintf(" % 1s |", $text);
-                }
+    /**
+     * @param QuestionHelper $questionHelper
+     * @param InputInterface $input
+     * @param OutputInterface $output
+     * @param ApiClient $apiClient
+     * @return ApiResponse
+     * @throws \BattleshipsApi\Client\Exception\ApiException
+     * @throws \Symfony\Component\OptionsResolver\Exception\ExceptionInterface
+     */
+    private function createUser(
+        QuestionHelper $questionHelper,
+        InputInterface $input,
+        OutputInterface $output,
+        ApiClient $apiClient
+    ): ApiResponse {
+        $question = new Question('Please enter your name: ');
+        $question->setValidator(function ($answer) {
+            $answer = trim($answer);
+            if ($answer === '') {
+                throw new \RuntimeException('Name cannot be empty');
             }
 
-            $board .= "  ";
-            for ($j = 0; $j < 11; $j++) {
-                if ($i == 0 && $j > 0) {
-                    if ($j == 1) {
-                        $board .= "     ";
-                    }
-                    $text = self::AXIS_X[($j - 1)];
-                    $board .= sprintf(" % 2s ", $text);
-                } elseif ($j == 0 && $i > 0) {
-                    $text = self::AXIS_Y[($i - 1)];
-                    $board .= sprintf(" % 2s |", $text);
-                } elseif ($j > 0 && $i > 0) {
-                    $coords = self::AXIS_Y[($i - 1)] . self::AXIS_X[($j - 1)];
-//                    $text = isset($battle->otherGround->{$coords})
-//                        ? $marks[ $battle->otherGround->{$coords} ]
-//                        : "";
-                    $text = '';
-                    $board .= sprintf(" % 1s |", $text);
-                }
+            return $answer;
+        });
+        $playerName = $questionHelper->ask($input, $output, $question);
+
+        $request = new CreateUserRequest();
+        $request->setUserName($playerName);
+
+        return $apiClient->call($request);
+    }
+
+    /**
+     * @param string $apiKey
+     * @param EventDispatcherInterface $eventDispatcher
+     * @param string $apiKeyStorageFile
+     * @throws \Exception
+     */
+    private function setupApiKey(string $apiKey, EventDispatcherInterface $eventDispatcher, string $apiKeyStorageFile)
+    {
+        // set API key
+        $preResolveListeners = $eventDispatcher->getListeners(ApiClientEvents::PRE_RESOLVE);
+        foreach ($preResolveListeners as $preResolveListener) {
+            if ($preResolveListener[0] instanceof RequestConfigListener) {
+                $preResolveListener[0]->setApiKey($apiKey);
+                break;
             }
-            $board .= "\n    ".str_repeat("+---", 10)."+";
-            $board .= "      ".str_repeat("+---", 10)."+\n";
         }
 
-        return $board;
+        // store API key
+        // files does not exist, or cannot be created, or cannot write into it
+        if (!file_exists($apiKeyStorageFile) || !touch($apiKeyStorageFile) || !is_writable($apiKeyStorageFile) || !file_put_contents($apiKeyStorageFile, $apiKey)) {
+            throw new \Exception(sprintf('Could not save API key into file `%s`', $apiKeyStorageFile));
+        }
     }
 
-    protected function write($t) {
-        fwrite(STDERR, $t);
-    }
+    /**
+     * @param QuestionHelper $questionHelper
+     * @param InputInterface $input
+     * @param OutputInterface $output
+     * @param ApiClient $apiClient
+     * @return int
+     * @throws \BattleshipsApi\Client\Exception\ApiException
+     * @throws \Symfony\Component\OptionsResolver\Exception\ExceptionInterface
+     */
+    private function handleGettingGameId(
+        QuestionHelper $questionHelper,
+        InputInterface $input,
+        OutputInterface $output,
+        ApiClient $apiClient
+    ): int {
+        $request = new GetGamesRequest();
+        $request->setAvailable(true);
+        $apiResponse = $apiClient->call($request);
 
-    protected function consoleWrite($t)
-    {
-        Cursor::save();
-        Cursor::back($this->currentColumn + ($this->board === 2 ? 47 : 0));
-        Cursor::forward($this->consoleCursor);
-        Cursor::down($this->currentLine);
-        $this->write($t);
-        $this->consoleCursor += strlen($t);
-        Cursor::restore();
-    }
-
-    protected function consoleEraseChar()
-    {
-        // all erased already
-        if ($this->consoleCursor <= 1) {
-            return;
+        $availableGames = ['new'];
+        foreach ($apiResponse->getJson() as $game) {
+            $availableGames[$game->id] = $game->other->name;
         }
 
-        Cursor::save();
-        Cursor::back($this->currentColumn + ($this->board === 2 ? 47 : 0));
-        Cursor::forward($this->consoleCursor - 1);
-        Cursor::down($this->currentLine);
-        Erase::eol();
-        $this->consoleCursor--;
-        Cursor::restore();
+        $question = new ChoiceQuestion('<question>Do you want to join a game, or start a new one? </question>', $availableGames, 0);
+        $answer = $questionHelper->ask($input, $output, $question);
+        if ($answer === 'new') {
+            $apiResponse = $apiClient->call(new CreateGameRequest());
+            $gameId = $apiResponse->getNewId();
+        } else {
+            $gameId = array_search($answer, $availableGames);
+            $request = new UpdateGameRequest();
+            $request
+                ->setGameId($gameId)
+                ->setJoinGame(true);
+            $apiClient->call($request);
+        }
+
+        return $gameId;
     }
 }
