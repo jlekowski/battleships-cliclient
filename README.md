@@ -46,4 +46,4 @@ bin/game --help
 ## === Changelog ===
 
 * version **0.1** (alpha)
- * Working version of the CLI Client with limited functionality
+  * Working version of the CLI Client with limited functionality
